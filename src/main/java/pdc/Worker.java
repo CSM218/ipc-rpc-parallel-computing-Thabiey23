@@ -36,6 +36,10 @@ public class Worker {
     private Thread listenThread;
     private Thread reconnectionThread;
     
+    // Track connection state
+    private int consecutiveFailures = 0;
+    private long lastSuccessfulHeartbeat = 0;
+    
     /**
      * Connects to the Master and initiates the connection.
      * The handshake must exchange 'Identifiers' between the master and worker.
@@ -80,9 +84,18 @@ public class Worker {
                             System.out.println("Successfully reconnected to master after " + 
                                              reconnectAttempts + " attempts");
                             reconnectAttempts = 0;
+                            consecutiveFailures = 0;
                         }
                     } else if (isConnected()) {
                         reconnectAttempts = 0; // Reset counter when connected
+                        
+                        // Check if we've missed too many heartbeats
+                        if (lastSuccessfulHeartbeat > 0 && 
+                            System.currentTimeMillis() - lastSuccessfulHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+                            System.out.println("No heartbeats received for too long, reconnecting...");
+                            connected = false;
+                            cleanup();
+                        }
                     }
                     
                 } catch (InterruptedException e) {
@@ -109,6 +122,12 @@ public class Worker {
                 masterSocket = new Socket(masterHost, masterPort);
                 masterSocket.setSoTimeout(SOCKET_TIMEOUT_MS);
                 
+                // Enable keep-alive
+                masterSocket.setKeepAlive(true);
+                
+                // Disable Nagle's algorithm for lower latency
+                masterSocket.setTcpNoDelay(true);
+                
                 // Increase buffer sizes for large messages
                 masterSocket.setReceiveBufferSize(262144); // 256KB
                 masterSocket.setSendBufferSize(262144); // 256KB
@@ -118,7 +137,8 @@ public class Worker {
                 
                 // Send registration message
                 Message regMsg = Message.createRegistration(workerId);
-                output.write(regMsg.pack());
+                byte[] packedMsg = regMsg.pack();
+                output.write(packedMsg);
                 output.flush();
                 
                 System.out.println("Registration sent, waiting for acknowledgment...");
@@ -133,6 +153,8 @@ public class Worker {
                     if ("WORKER_ACK".equals(response.type)) {
                         System.out.println("Worker " + workerId + " successfully registered with master");
                         connected = true;
+                        consecutiveFailures = 0;
+                        lastSuccessfulHeartbeat = System.currentTimeMillis();
                         
                         // Start heartbeat thread
                         startHeartbeats();
@@ -141,12 +163,18 @@ public class Worker {
                         startListenThread();
                         
                         return true;
+                    } else {
+                        System.err.println("Unexpected response type: " + response.type);
                     }
+                } else {
+                    System.err.println("No response from master");
                 }
                 
             } catch (ConnectException e) {
+                consecutiveFailures++;
                 retries++;
-                System.err.println("Failed to connect to master (attempt " + retries + "/" + MAX_RETRIES + "): " + e.getMessage());
+                System.err.println("Failed to connect to master (attempt " + retries + "/" + MAX_RETRIES + 
+                                 ", consecutive failures: " + consecutiveFailures + "): " + e.getMessage());
                 
                 if (retries < MAX_RETRIES) {
                     System.out.println("Retrying in " + (RETRY_DELAY_MS/1000) + " seconds...");
@@ -157,16 +185,19 @@ public class Worker {
                         break;
                     }
                 } else {
-                    System.err.println("Max connection retries reached.");
+                    System.err.println("Max connection retries reached. Will continue trying in background...");
+                    // Don't give up completely, reconnection thread will keep trying
                 }
                 
             } catch (SocketTimeoutException e) {
-                System.err.println("Connection timeout: " + e.getMessage());
+                consecutiveFailures++;
                 retries++;
+                System.err.println("Connection timeout (attempt " + retries + "/" + MAX_RETRIES + "): " + e.getMessage());
                 
             } catch (IOException e) {
-                System.err.println("Error during cluster join: " + e.getMessage());
+                consecutiveFailures++;
                 retries++;
+                System.err.println("Error during cluster join (attempt " + retries + "/" + MAX_RETRIES + "): " + e.getMessage());
                 
                 try {
                     Thread.sleep(RETRY_DELAY_MS);
@@ -187,12 +218,15 @@ public class Worker {
      * Check if worker is connected to master
      */
     private boolean isConnected() {
-        return connected && 
-               masterSocket != null && 
-               masterSocket.isConnected() && 
-               !masterSocket.isClosed() &&
-               output != null &&
-               input != null;
+        boolean socketConnected = masterSocket != null && 
+                                  masterSocket.isConnected() && 
+                                  !masterSocket.isClosed() &&
+                                  !masterSocket.isInputShutdown() &&
+                                  !masterSocket.isOutputShutdown() &&
+                                  output != null &&
+                                  input != null;
+        
+        return connected && socketConnected;
     }
     
     /**
@@ -206,21 +240,30 @@ public class Worker {
                 byte[] buffer = new byte[262144]; // 256KB buffer for large messages
                 int bytesRead;
                 
-                while (connected && running && input != null && (bytesRead = input.read(buffer)) != -1) {
-                    if (bytesRead > 0) {
-                        processMessages(buffer, bytesRead);
+                while (connected && running && input != null) {
+                    try {
+                        bytesRead = input.read(buffer);
+                        
+                        if (bytesRead == -1) {
+                            System.out.println("Connection closed by master");
+                            break;
+                        }
+                        
+                        if (bytesRead > 0) {
+                            processMessages(buffer, bytesRead);
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // Timeout is expected, just continue and check connection
+                        continue;
                     }
                 }
-            } catch (SocketTimeoutException e) {
-                // Timeout is expected, just continue
-                System.out.println("Listen timeout - checking connection...");
             } catch (IOException e) {
                 if (connected && running) {
-                    System.err.println("Connection to master lost: " + e.getMessage());
-                    connected = false;
+                    System.err.println("Connection to master lost in listen thread: " + e.getMessage());
                 }
             } finally {
                 if (connected) {
+                    System.out.println("Listen thread ending, marking as disconnected");
                     connected = false;
                     cleanup();
                 }
@@ -265,6 +308,7 @@ public class Worker {
         switch (message.type) {
             case "HEARTBEAT":
                 System.out.println("Heartbeat received from master");
+                lastSuccessfulHeartbeat = System.currentTimeMillis();
                 sendHeartbeat();
                 break;
                 
@@ -288,7 +332,6 @@ public class Worker {
         System.out.println("Received chunk " + message.getChunkId() + 
                          " of " + message.getTotalChunks());
         
-        // TODO: Implement chunk reassembly
         // For now, just acknowledge receipt
         Message ack = new Message("WORKER_ACK", workerId, 
             ("Chunk " + message.getChunkId() + " received").getBytes());
@@ -317,7 +360,9 @@ public class Worker {
             for (int i = 0; i < steps; i++) {
                 Thread.sleep(workDuration / steps);
                 if (i % 3 == 0) {
-                    sendHeartbeat(); // Keep connection alive during long tasks
+                    if (isConnected()) {
+                        sendHeartbeat(); // Keep connection alive during long tasks
+                    }
                 }
             }
             
@@ -325,26 +370,33 @@ public class Worker {
             String result = "Task " + taskId + " completed by " + workerId;
             Message response = new Message("TASK_COMPLETE", workerId, result.getBytes());
             
-            output.write(response.pack());
-            output.flush();
-            
-            System.out.println("Task " + taskId + " completed");
+            if (isConnected() && output != null) {
+                output.write(response.pack());
+                output.flush();
+                System.out.println("Task " + taskId + " completed");
+            } else {
+                System.err.println("Cannot send task response - not connected");
+            }
             
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            Message errorMsg = new Message("TASK_ERROR", workerId, 
-                ("Task interrupted: " + e.getMessage()).getBytes());
-            output.write(errorMsg.pack());
-            output.flush();
+            if (isConnected() && output != null) {
+                Message errorMsg = new Message("TASK_ERROR", workerId, 
+                    ("Task interrupted: " + e.getMessage()).getBytes());
+                output.write(errorMsg.pack());
+                output.flush();
+            }
             
         } catch (Exception e) {
             System.err.println("Error processing task: " + e.getMessage());
             
             // Send error response
-            Message errorMsg = new Message("TASK_ERROR", workerId, 
-                ("Task failed: " + e.getMessage()).getBytes());
-            output.write(errorMsg.pack());
-            output.flush();
+            if (isConnected() && output != null) {
+                Message errorMsg = new Message("TASK_ERROR", workerId, 
+                    ("Task failed: " + e.getMessage()).getBytes());
+                output.write(errorMsg.pack());
+                output.flush();
+            }
         }
     }
     
@@ -359,7 +411,7 @@ public class Worker {
                 try {
                     Thread.sleep(HEARTBEAT_INTERVAL_MS);
                     
-                    if (connected && output != null) {
+                    if (isConnected() && output != null) {
                         sendHeartbeat();
                         missedHeartbeats = 0; // Reset on success
                     }
@@ -381,6 +433,7 @@ public class Worker {
                     }
                 }
             }
+            System.out.println("Heartbeat thread stopped");
         });
         
         heartbeatThread.setDaemon(true);
@@ -392,7 +445,7 @@ public class Worker {
      * Send heartbeat to master
      */
     private void sendHeartbeat() throws IOException {
-        if (output != null && connected) {
+        if (isConnected() && output != null) {
             Message heartbeat = Message.createHeartbeat(workerId);
             output.write(heartbeat.pack());
             output.flush();
@@ -428,22 +481,47 @@ public class Worker {
             connected = false;
             
             if (input != null) {
-                try { input.close(); } catch (IOException e) { /* Ignore */ }
+                try { 
+                    input.close(); 
+                } catch (IOException e) { 
+                    // Ignore
+                }
                 input = null;
             }
             
             if (output != null) {
-                try { output.close(); } catch (IOException e) { /* Ignore */ }
+                try { 
+                    output.close(); 
+                } catch (IOException e) { 
+                    // Ignore
+                }
                 output = null;
             }
             
             if (masterSocket != null && !masterSocket.isClosed()) {
-                try { masterSocket.close(); } catch (IOException e) { /* Ignore */ }
+                try { 
+                    masterSocket.close(); 
+                } catch (IOException e) { 
+                    // Ignore
+                }
                 masterSocket = null;
             }
             
         } catch (Exception e) {
             System.err.println("Error during cleanup: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Handle connection loss and trigger reconnection
+     */
+    private void handleConnectionLoss() {
+        if (connected) {
+            System.out.println("Connection lost, initiating reconnection...");
+            connected = false;
+            cleanup();
+            
+            // Reconnection thread will handle the actual reconnection
         }
     }
     
@@ -454,6 +532,18 @@ public class Worker {
         System.out.println("Shutting down worker " + workerId);
         running = false;
         connected = false;
+        
+        // Interrupt threads
+        if (heartbeatThread != null) {
+            heartbeatThread.interrupt();
+        }
+        if (listenThread != null) {
+            listenThread.interrupt();
+        }
+        if (reconnectionThread != null) {
+            reconnectionThread.interrupt();
+        }
+        
         cleanup();
     }
     
@@ -474,20 +564,27 @@ public class Worker {
         
         // Add shutdown hook for graceful shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down worker...");
+            System.out.println("Shutdown hook triggered");
             worker.shutdown();
         }));
         
         worker.joinCluster(masterHost, masterPort);
         
-        // Keep main thread alive
+        // Keep main thread alive and monitor connection
         while (worker.running) {
             try {
                 Thread.sleep(1000);
+                
+                // Print connection status periodically for debugging
+                if (!worker.isConnected() && worker.running) {
+                    System.out.println("Main thread: Not connected, waiting for reconnection...");
+                }
             } catch (InterruptedException e) {
                 worker.shutdown();
                 break;
             }
         }
+        
+        System.out.println("Worker main thread exiting");
     }
 }
